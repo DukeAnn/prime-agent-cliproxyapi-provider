@@ -1,10 +1,14 @@
-import type { Context, Tool } from "@earendil-works/pi-ai";
-import { describe, expect, it } from "vitest";
+import type { Api, Context, Model, SimpleStreamOptions, Tool } from "@earendil-works/pi-ai";
+import { describe, expect, it, vi } from "vitest";
 import {
 	adaptContextForModule,
 	adaptTranscriptContext,
+	assertOutboundToolsRetained,
+	collectContextToolNames,
 	ensureTranscriptContext,
+	extractPayloadToolNames,
 	supportsTranscriptSource,
+	withCodexToolGuard,
 } from "../extensions/codex-stream.ts";
 
 describe("adaptTranscriptContext", () => {
@@ -239,5 +243,95 @@ describe("adaptContextForModule", () => {
 		expect(result.tools?.[0]?.name).toBe("bash");
 		expect(result.messages).toHaveLength(1);
 		expect(result.messages[0]).toEqual({ role: "user", content: "Run pwd", timestamp: 1000 });
+	});
+});
+
+describe("codex tool retention", () => {
+	const classicToolContext: Context = {
+		systemPrompt: "Classic instructions",
+		tools: [
+			{
+				name: "ipython",
+				description: "Run python",
+				parameters: { type: "object", properties: {} },
+			} as Tool,
+		],
+		messages: [{ role: "user", content: "run pwd", timestamp: 1000 }],
+	};
+
+	const testModel = { id: "gpt-5.6-sol", provider: "cliproxyapi" } as Model<Api>;
+
+	it("keeps classic top-level tools reachable for a transcript-aware module (root-cause regression)", () => {
+		// pi 0.9.x hosts pass classic top-level tools; pi-ai >=0.86 reads tools from the transcript.
+		// Without ensureTranscriptContext the outbound payload loses every tool.
+		const adapted = adaptContextForModule(classicToolContext, true);
+		const systemMessage = adapted.messages[0] as { role: string; toolsAdded?: Tool[] };
+
+		expect(systemMessage.role).toBe("system");
+		expect(systemMessage.toolsAdded?.map((tool) => tool.name)).toEqual(["ipython"]);
+		expect(collectContextToolNames(adapted)).toEqual(["ipython"]);
+	});
+
+	it("collects tool names from both context shapes and honours tool removal", () => {
+		expect(collectContextToolNames(classicToolContext)).toEqual(["ipython"]);
+		expect(
+			collectContextToolNames({
+				messages: [
+					{ role: "system", toolsAdded: [{ name: "read" }, { name: "bash" }] },
+					{ role: "system", toolsRemoved: [{ name: "read" }] },
+				],
+			}),
+		).toEqual(["bash"]);
+		expect(collectContextToolNames({ messages: [] })).toEqual([]);
+		expect(collectContextToolNames(undefined)).toEqual([]);
+	});
+
+	it("reads tool names from OpenAI and nested function payload shapes", () => {
+		expect(extractPayloadToolNames({ tools: [{ name: "ipython" }, { function: { name: "read" } }] })).toEqual([
+			"ipython",
+			"read",
+		]);
+		expect(extractPayloadToolNames({ tools: [] })).toEqual([]);
+		expect(extractPayloadToolNames({})).toEqual([]);
+	});
+
+	it("fails loudly when the outbound payload drops every context tool", () => {
+		expect(() => assertOutboundToolsRetained(["ipython"], { model: "gpt-5.6-sol" })).toThrow(
+			/dropped all 1 context tools \(ipython\)/,
+		);
+		expect(() => assertOutboundToolsRetained(["ipython"], { tools: [{ name: "ipython" }] })).not.toThrow();
+		// No tools requested means nothing to protect.
+		expect(() => assertOutboundToolsRetained([], { model: "gpt-5.6-sol" })).not.toThrow();
+	});
+
+	it("guards the payload hook and keeps the caller hooks in the chain", async () => {
+		const userOnPayload = vi.fn(async () => undefined);
+		const userOnResponse = vi.fn(async () => undefined);
+		const guarded = withCodexToolGuard(classicToolContext, testModel, {
+			apiKey: "k",
+			onPayload: userOnPayload,
+			onResponse: userOnResponse,
+		} as SimpleStreamOptions) as SimpleStreamOptions;
+
+		expect((guarded as { apiKey?: string }).apiKey).toBe("k");
+		await expect(guarded.onPayload?.({ tools: [] }, testModel)).rejects.toThrow(
+			/refusing to send a tool-less request/,
+		);
+		expect(userOnPayload).not.toHaveBeenCalled();
+
+		await guarded.onPayload?.({ tools: [{ name: "ipython" }] }, testModel);
+		expect(userOnPayload).toHaveBeenCalledTimes(1);
+
+		await guarded.onResponse?.({ status: 200, headers: {} }, testModel);
+		expect(userOnResponse).toHaveBeenCalledTimes(1);
+	});
+
+	it("passes through requests that declare no tools", async () => {
+		const guarded = withCodexToolGuard(
+			{ messages: [{ role: "user", content: "hi", timestamp: 1 }] },
+			testModel,
+			undefined,
+		) as SimpleStreamOptions;
+		await expect(guarded.onPayload?.({ model: "gpt-5.6-sol" }, testModel)).resolves.toBeUndefined();
 	});
 });

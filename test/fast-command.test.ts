@@ -23,7 +23,16 @@ function createCommandHarness(
 		}),
 	} as unknown as ExtensionAPI;
 
-	registerFastCommand({ pi, agentDir, providerId: "cliproxyapi", fastMode, onStatusChange, onModeChange });
+	registerFastCommand({
+		pi,
+		agentDir,
+		providerId: "cliproxyapi",
+		fastMode,
+		// Pin the Pi host name so the suite does not depend on the ambient host.
+		commandName: "fast",
+		onStatusChange,
+		onModeChange,
+	});
 
 	const ctx = {
 		model: currentModel,

@@ -3,6 +3,7 @@
 	"apiKey": "12345",
 	"fast": false,
 	"pause": false,
+	"transportMode": "auto",
 	"providerId": "cliproxyapi",
 	"providerName": "CLIProxyAPI"
 }
