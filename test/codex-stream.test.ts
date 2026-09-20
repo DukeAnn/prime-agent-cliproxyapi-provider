@@ -76,7 +76,7 @@ function writeOmpPluginsCodexTree(home: string): { codexPath: string; jsonParseP
 }
 
 describe("wellKnownCodexModuleCandidates", () => {
-	it("lists HOME/.omp and HOME/.pi plugin roots without host-specific paths", () => {
+	it("lists HOME/.omp, HOME/.pi and HOME/.prime plugin roots without host-specific paths", () => {
 		const candidates = wellKnownCodexModuleCandidates("/home/user");
 		expect(candidates).toEqual([
 			join("/home/user", ".omp", "plugins", CODEX_RELATIVE),
@@ -85,6 +85,17 @@ describe("wellKnownCodexModuleCandidates", () => {
 			join(
 				"/home/user",
 				".pi",
+				"agent",
+				"npm",
+				"node_modules",
+				"@earendil-works",
+				"pi-coding-agent",
+				CODEX_RELATIVE,
+			),
+			join("/home/user", ".prime", "agent", "npm", CODEX_RELATIVE),
+			join(
+				"/home/user",
+				".prime",
 				"agent",
 				"npm",
 				"node_modules",

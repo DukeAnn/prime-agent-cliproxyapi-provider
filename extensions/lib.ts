@@ -5,7 +5,6 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { readStoredCredential } from "@earendil-works/pi-coding-agent";
 
 // Local shape matching pi ThinkingLevelMap; avoid hard runtime peer imports here.
 export type ThinkingLevelMap = Partial<
@@ -21,6 +20,24 @@ export const AUTH_FILE_NAME = "auth.json";
 export const CLIENT_VERSION = "pi";
 export const MODELS_REQUEST_TIMEOUT_MS = 60_000;
 
+/** Env var set by Prime Agent hosts; it points at the active agent directory. */
+export const PRIME_AGENT_DIR_ENV = "PRIME_AGENT_CODING_AGENT_DIR";
+/** Opt-in, secret-free debug logging. */
+export const DEBUG_ENV = "CLIPROXYAPI_DEBUG";
+/** Protocol routing selector: auto | native | codex. */
+export const TRANSPORT_MODE_ENV = "CLIPROXYAPI_TRANSPORT_MODE";
+
+/** Pi registers the Fast toggle as /fast; Prime Agent already owns /fast. */
+export const DEFAULT_FAST_COMMAND_NAME = "fast";
+export const PRIME_FAST_COMMAND_NAME = "cliproxyapi-fast";
+
+/** Custom api id used for every registered CLIProxyAPI model. */
+export const CLIPROXYAPI_CODEX_API_ID = "cliproxyapi-codex-responses";
+export const OPENAI_RESPONSES_API_ID = "openai-responses";
+export const ANTHROPIC_MESSAGES_API_ID = "anthropic-messages";
+export const GOOGLE_GENERATIVE_AI_API_ID = "google-generative-ai";
+export const OPENAI_COMPLETIONS_API_ID = "openai-completions";
+
 /** Keep login credentials effectively permanent; reconfigure via /login. */
 export const CREDENTIAL_TTL_MS = 100 * 365 * 24 * 60 * 60 * 1000;
 export const MODELS_DEV_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -31,6 +48,35 @@ export const DEFAULT_CONTEXT_WINDOW = 128000;
 
 const PI_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
 
+/**
+ * Protocol routing mode.
+ *
+ * - `codex`: every model uses the patched cliproxyapi-codex-responses transport ({root}/backend-api/).
+ * - `native`: every model uses the CLIProxyAPI endpoint that matches its family.
+ * - `auto` (default): known GPT/Claude/Gemini/Grok families use native endpoints,
+ *   unknown model ids stay on Codex for compatibility.
+ *
+ * This is unrelated to CLIPROXYAPI_TRANSPORT, which only selects websocket/SSE
+ * inside the Codex transport.
+ */
+export const TRANSPORT_MODES = ["auto", "native", "codex"] as const;
+export type TransportMode = (typeof TRANSPORT_MODES)[number];
+export const DEFAULT_TRANSPORT_MODE: TransportMode = "auto";
+
+export type ModelFamily = "gpt" | "claude" | "gemini" | "grok" | "unknown";
+
+export interface ModelRoute {
+	/** Api id handed to the resolved stream implementation. */
+	api: string;
+	/** Base URL for that api id. */
+	baseUrl: string;
+	/** Optional per-api compatibility overrides. */
+	compat?: Record<string, unknown>;
+	/** True when a pi built-in adapter must serve the request. */
+	native: boolean;
+	family: ModelFamily;
+}
+
 export interface CliproxyConfigFile {
 	baseUrl?: string;
 	apiKey?: string;
@@ -38,6 +84,7 @@ export interface CliproxyConfigFile {
 	providerName?: string;
 	fast?: boolean;
 	pause?: boolean;
+	transportMode?: TransportMode;
 }
 
 export interface ResolvedIdentity {
@@ -121,6 +168,8 @@ export interface MappedModels {
 	inferenceBaseUrl: string;
 	modelsUrl: string;
 	fastMode?: boolean;
+	/** Protocol routing mode this catalog was mapped for. */
+	transportMode?: TransportMode;
 }
 
 export interface ModelsCacheFile extends MappedModels {
@@ -184,6 +233,7 @@ export function resolveEndpoints(baseUrlInput: string): {
 	inferenceBaseUrl: string;
 	modelsUrl: string;
 	rootOrigin: string;
+	rootBaseUrl: string;
 } {
 	let raw = baseUrlInput.trim();
 	if (!raw) {
@@ -215,7 +265,126 @@ export function resolveEndpoints(baseUrlInput: string): {
 		inferenceBaseUrl,
 		modelsUrl,
 		rootOrigin: url.origin,
+		rootBaseUrl: `${url.origin}${rootPath}`,
 	};
+}
+
+/**
+ * Reduce any CLIProxyAPI endpoint form to its protocol-free root.
+ *
+ * Accepts the Codex inference URL (`{root}/backend-api/`), a native URL
+ * (`{root}/v1`, `{root}/v1beta`) or an already-root URL. A scheme-less value is
+ * treated as http. The value is parsed with `new URL`, so a malformed or
+ * non-http(s) input fails loudly instead of producing a broken endpoint.
+ */
+export function resolveRootBaseUrl(baseUrl: string): string {
+	const trimmed = baseUrl.trim();
+	if (!trimmed) {
+		throw new Error("baseUrl is empty");
+	}
+
+	// Detect the scheme on the raw value so a truncated input such as "http://"
+	// cannot be reshaped into a different host.
+	const schemeMatch = trimmed.match(/^([a-z][a-z0-9+.-]*):\/\//i);
+	if (schemeMatch && !/^https?$/i.test(schemeMatch[1])) {
+		throw new Error(`baseUrl must use http or https: ${trimmed}`);
+	}
+
+	let url: URL;
+	try {
+		url = new URL(schemeMatch ? trimmed : `http://${trimmed}`);
+	} catch {
+		throw new Error(`baseUrl is not a valid URL: ${trimmed}`);
+	}
+	if (url.protocol !== "http:" && url.protocol !== "https:") {
+		throw new Error(`baseUrl must use http or https: ${trimmed}`);
+	}
+	if (!url.hostname) {
+		throw new Error(`baseUrl is not a valid URL: ${trimmed}`);
+	}
+
+	const path = url.pathname.replace(/\/+$/, "").replace(/\/(?:backend-api|v1beta|v1)$/, "");
+	return `${url.origin}${path}`;
+}
+
+/**
+ * Detect the model family used for protocol routing.
+ *
+ * Route prefixes such as `relay-apikeyfun/claude-sonnet-5` are stripped for detection only;
+ * the model id itself is always sent unchanged.
+ */
+export function detectModelFamily(modelId: string): ModelFamily {
+	const id = modelId.trim().toLowerCase();
+	const bare = id.includes("/") ? id.slice(id.lastIndexOf("/") + 1) : id;
+	if (bare.startsWith("gpt-")) return "gpt";
+	if (bare.startsWith("claude-")) return "claude";
+	if (bare.startsWith("gemini-")) return "gemini";
+	if (bare.startsWith("grok-")) return "grok";
+	return "unknown";
+}
+
+/** Codex transport route for a CLIProxyAPI root URL. */
+function codexRoute(rootBaseUrl: string, family: ModelFamily): ModelRoute {
+	return {
+		api: CLIPROXYAPI_CODEX_API_ID,
+		baseUrl: `${rootBaseUrl}/backend-api/`,
+		native: false,
+		family,
+	};
+}
+
+/**
+ * Resolve the protocol, endpoint and compat overrides for one model id.
+ *
+ * @param modelId - CLIProxyAPI model id, route prefix included
+ * @param transportMode - auto | native | codex
+ * @param baseUrl - any CLIProxyAPI endpoint form; only its root is used
+ */
+export function resolveModelRoute(modelId: string, transportMode: TransportMode, baseUrl: string): ModelRoute {
+	const root = resolveRootBaseUrl(baseUrl);
+	const family = detectModelFamily(modelId);
+
+	if (transportMode === "codex") {
+		return codexRoute(root, family);
+	}
+
+	switch (family) {
+		case "gpt":
+		case "grok":
+			return { api: OPENAI_RESPONSES_API_ID, baseUrl: `${root}/v1`, native: true, family };
+		case "claude":
+			return {
+				api: ANTHROPIC_MESSAGES_API_ID,
+				baseUrl: root,
+				// CLIProxyAPI rejects per-tool eager_input_streaming.
+				compat: { supportsEagerToolInputStreaming: false },
+				native: true,
+				family,
+			};
+		case "gemini":
+			return { api: GOOGLE_GENERATIVE_AI_API_ID, baseUrl: `${root}/v1beta`, native: true, family };
+		default:
+			// auto keeps unknown ids on the proven Codex transport.
+			return transportMode === "native"
+				? { api: OPENAI_COMPLETIONS_API_ID, baseUrl: `${root}/v1`, native: true, family }
+				: codexRoute(root, family);
+	}
+}
+
+/** Base URL that matches an already-selected api id. Used to repair stored model URLs. */
+export function resolveProtocolBaseUrl(api: string, baseUrl: string): string {
+	const root = resolveRootBaseUrl(baseUrl);
+	switch (api) {
+		case ANTHROPIC_MESSAGES_API_ID:
+			return root;
+		case GOOGLE_GENERATIVE_AI_API_ID:
+			return `${root}/v1beta`;
+		case OPENAI_RESPONSES_API_ID:
+		case OPENAI_COMPLETIONS_API_ID:
+			return `${root}/v1`;
+		default:
+			return `${root}/backend-api/`;
+	}
 }
 
 export function encodeRefreshMeta(baseUrl: string): string {
@@ -268,7 +437,16 @@ export function saveConfigFile(agentDir: string, config: CliproxyConfigFile): vo
 	writeFileSync(configPath, `${JSON.stringify(next, null, 2)}\n`, "utf8");
 }
 
-export function loadModelsCache(agentDir: string, baseUrlInput: string): ModelsCacheFile | null {
+/**
+ * Load the on-disk model cache.
+ *
+ * @param transportMode - When provided, a cache written for another protocol routing mode is rejected.
+ */
+export function loadModelsCache(
+	agentDir: string,
+	baseUrlInput: string,
+	transportMode?: TransportMode,
+): ModelsCacheFile | null {
 	const cachePath = join(agentDir, MODELS_CACHE_FILE_NAME);
 	try {
 		const parsed = JSON.parse(readFileSync(cachePath, "utf8")) as Partial<ModelsCacheFile>;
@@ -280,6 +458,9 @@ export function loadModelsCache(agentDir: string, baseUrlInput: string): ModelsC
 			!Array.isArray(parsed.models) ||
 			!Array.isArray(parsed.fastModelIds)
 		) {
+			return null;
+		}
+		if (transportMode !== undefined && (parsed.transportMode ?? DEFAULT_TRANSPORT_MODE) !== transportMode) {
 			return null;
 		}
 		return parsed as ModelsCacheFile;
@@ -294,8 +475,40 @@ export function saveModelsCache(agentDir: string, loaded: MappedModels, fetchedA
 	writeFileSync(cachePath, `${JSON.stringify({ ...loaded, fetchedAt }, null, 2)}\n`, "utf8");
 }
 
+interface StoredCredentialEntry {
+	type?: unknown;
+	access?: unknown;
+	refresh?: unknown;
+	key?: unknown;
+	expires?: unknown;
+}
+
+/**
+ * Read one provider entry from the agent auth.json.
+ *
+ * Parsed locally on purpose: Prime Agent hosts do not expose
+ * `readStoredCredential` to plugins at runtime, and a missing export must not
+ * break login detection. Only the requested provider entry is read; no
+ * credential value is logged.
+ */
+export function readAuthCredential(agentDir: string, providerId: string): StoredCredentialEntry | null {
+	try {
+		const parsed: unknown = JSON.parse(readFileSync(join(agentDir, AUTH_FILE_NAME), "utf8"));
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+			return null;
+		}
+		const entry = (parsed as Record<string, unknown>)[providerId];
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+			return null;
+		}
+		return entry as StoredCredentialEntry;
+	} catch {
+		return null;
+	}
+}
+
 export function loadAuthConnection(agentDir: string, providerId: string): { baseUrl?: string; apiKey?: string } | null {
-	const entry = readStoredCredential(providerId, join(agentDir, AUTH_FILE_NAME));
+	const entry = readAuthCredential(agentDir, providerId);
 	if (entry?.type === "oauth" && typeof entry.access === "string" && entry.access.trim()) {
 		const meta = decodeRefreshMeta(typeof entry.refresh === "string" ? entry.refresh : undefined);
 		return {
@@ -360,6 +573,106 @@ export function resolveFastDefault(agentDir: string): boolean {
 		throw new Error(`${CONFIG_FILE_NAME} field "fast" must be a boolean`);
 	}
 	return file.fast;
+}
+
+/** Agent directory reported by a Prime Agent host, when present. */
+export function resolvePrimeAgentDir(): string | undefined {
+	return firstNonEmpty(process.env[PRIME_AGENT_DIR_ENV]);
+}
+
+/**
+ * True when a resolved agent directory is a Prime Agent directory.
+ *
+ * Matches the normalized `.prime/agent` tail on both POSIX and Windows paths.
+ */
+export function isPrimeAgentDirPath(agentDir: string | undefined): boolean {
+	if (!agentDir?.trim()) {
+		return false;
+	}
+	const normalized = agentDir.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+	return normalized === ".prime/agent" || normalized.endsWith("/.prime/agent");
+}
+
+/**
+ * True when the extension runs inside a Prime Agent host.
+ *
+ * Two independent signals, because a default Prime run does not always export the
+ * override env var:
+ * 1. a non-empty PRIME_AGENT_CODING_AGENT_DIR (explicit signal, custom dirs included)
+ * 2. a resolved agent directory that ends with `.prime/agent`
+ */
+export function isPrimeHost(agentDir?: string): boolean {
+	return resolvePrimeAgentDir() !== undefined || isPrimeAgentDirPath(agentDir);
+}
+
+/**
+ * Resolve the agent directory.
+ *
+ * A non-empty PRIME_AGENT_CODING_AGENT_DIR is an explicit override. Otherwise
+ * use the host-provided `getAgentDir()` result supplied by the caller.
+ */
+export function resolveAgentDir(fallback: () => string): string {
+	return resolvePrimeAgentDir() ?? fallback();
+}
+
+/**
+ * Prime Agent owns /fast, so the provider toggle is renamed there.
+ *
+ * @param options.primeHost - Already resolved host decision; skips every environment lookup.
+ * @param options.agentDir - Resolved agent directory used when `primeHost` is absent.
+ */
+export function resolveFastCommandName(options: { primeHost?: boolean; agentDir?: string } = {}): string {
+	const primeHost = options.primeHost ?? isPrimeHost(options.agentDir);
+	return primeHost ? PRIME_FAST_COMMAND_NAME : DEFAULT_FAST_COMMAND_NAME;
+}
+
+/** True when CLIPROXYAPI_DEBUG opts into safe diagnostic logging. */
+export function isDebugEnabled(): boolean {
+	const raw = firstNonEmpty(process.env[DEBUG_ENV]);
+	return raw === undefined ? false : parseBooleanSetting(raw) === true;
+}
+
+/**
+ * Log one safe diagnostic line when CLIPROXYAPI_DEBUG is on.
+ *
+ * Callers must pass metadata only. API keys, credentials, prompt text, tool
+ * arguments and request/response bodies must never be given to this function.
+ */
+export function debugLog(message: string, fields: Record<string, string | number | boolean | undefined> = {}): void {
+	if (!isDebugEnabled()) {
+		return;
+	}
+	const rendered = Object.entries(fields)
+		.filter(([, value]) => value !== undefined)
+		.map(([key, value]) => `${key}=${value}`)
+		.join(" ");
+	console.info(`[pi-cliproxyapi-provider][debug] ${message}${rendered ? ` ${rendered}` : ""}`);
+}
+
+export function parseTransportMode(value: string): TransportMode | undefined {
+	const normalized = value.trim().toLowerCase();
+	return (TRANSPORT_MODES as readonly string[]).includes(normalized) ? (normalized as TransportMode) : undefined;
+}
+
+/** Resolve protocol routing from env, then cliproxyapi.json, then `auto`. */
+export function resolveTransportMode(agentDir: string): TransportMode {
+	const envValue = firstNonEmpty(process.env[TRANSPORT_MODE_ENV]);
+	if (envValue !== undefined) {
+		const parsed = parseTransportMode(envValue);
+		if (parsed === undefined) {
+			throw new Error(`${TRANSPORT_MODE_ENV} must be one of: ${TRANSPORT_MODES.join(", ")}`);
+		}
+		return parsed;
+	}
+
+	const file = loadConfigFile(agentDir);
+	if (file.transportMode === undefined) {
+		return DEFAULT_TRANSPORT_MODE;
+	}
+	if (typeof file.transportMode !== "string" || parseTransportMode(file.transportMode) === undefined) {
+		throw new Error(`${CONFIG_FILE_NAME} field "transportMode" must be one of: ${TRANSPORT_MODES.join(", ")}`);
+	}
+	return parseTransportMode(file.transportMode)!;
 }
 
 /** Resolve the request pause preference from cliproxyapi.json, defaulting to false. */
@@ -872,6 +1185,7 @@ export async function loadMappedModels(
 	timeoutOrFastMode: number | boolean = MODELS_REQUEST_TIMEOUT_MS,
 	agentDir?: string,
 	signal?: AbortSignal,
+	transportMode: TransportMode = DEFAULT_TRANSPORT_MODE,
 ): Promise<MappedModels> {
 	const pricingEnabled = typeof timeoutOrFastMode === "boolean";
 	const effectiveFastMode = typeof timeoutOrFastMode === "boolean" ? timeoutOrFastMode : false;
@@ -900,6 +1214,7 @@ export async function loadMappedModels(
 		inferenceBaseUrl: endpoints.inferenceBaseUrl,
 		modelsUrl: endpoints.modelsUrl,
 		...(pricingEnabled ? { fastMode: effectiveFastMode } : {}),
+		transportMode,
 	};
 }
 
@@ -916,19 +1231,29 @@ export async function resolveMappedModels(
 		fastMode?: boolean;
 		signal?: AbortSignal;
 		shouldCommit?: () => boolean;
+		transportMode?: TransportMode;
 	} = {},
 ): Promise<ResolvedModelsResult> {
+	const transportMode = options.transportMode ?? DEFAULT_TRANSPORT_MODE;
 	const cacheMatchesFastMode = (cache: ModelsCacheFile): boolean =>
 		options.fastMode === undefined || (cache.fastMode ?? false) === options.fastMode;
 
 	if (!options.forceRefresh) {
-		const cache = loadModelsCache(agentDir, baseUrlInput);
+		// A cache written for another protocol routing mode is discarded.
+		const cache = loadModelsCache(agentDir, baseUrlInput, transportMode);
 		if (cache && cacheMatchesFastMode(cache)) {
 			return { loaded: cache, fromCache: true };
 		}
 	}
 
-	const loaded = await loadMappedModels(baseUrlInput, apiKey, options.fastMode, agentDir, options.signal);
+	const loaded = await loadMappedModels(
+		baseUrlInput,
+		apiKey,
+		options.fastMode,
+		agentDir,
+		options.signal,
+		transportMode,
+	);
 	if (!options.signal?.aborted && (options.shouldCommit?.() ?? true)) {
 		saveModelsCache(agentDir, loaded);
 	}

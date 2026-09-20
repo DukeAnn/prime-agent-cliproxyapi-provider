@@ -32,7 +32,10 @@ import {
 	applyFastPayloadHook,
 	CLIPROXYAPI_CODEX_API,
 	type CliproxyCodexStreamSimple,
+	extractPayloadToolNames,
+	type HostNativeStreams,
 	loadCliproxyCodexStreams,
+	loadHostNativeStreams,
 } from "./codex-stream.ts";
 import { FastModeController } from "./fast.ts";
 import { FastFooterController } from "./fast-footer.ts";
@@ -40,20 +43,31 @@ import {
 	CONFIG_FILE_NAME,
 	CREDENTIAL_TTL_MS,
 	DEFAULT_BASE_URL,
+	DEFAULT_TRANSPORT_MODE,
+	debugLog,
 	decodeRefreshMeta,
 	encodeRefreshMeta,
 	firstNonEmpty,
+	isDebugEnabled,
+	isPrimeHost,
 	isUnauthorizedModelsError,
 	loadAuthConnection,
 	loadConfigFile,
+	type ModelRoute,
 	type PiProviderModel,
+	resolveAgentDir,
 	resolveConnection,
 	resolveEndpoints,
+	resolveFastCommandName,
 	resolveFastDefault,
 	resolveIdentity,
 	resolveMappedModels,
+	resolveModelRoute,
 	resolvePauseDefault,
+	resolveProtocolBaseUrl,
+	resolveTransportMode,
 	saveConfigFile,
+	type TransportMode,
 } from "./lib.ts";
 import type { PauseController } from "./pause.ts";
 import { pauseController, waitForPauseToEnd } from "./pause.ts";
@@ -89,12 +103,145 @@ class ModelRefreshCoordinator {
 	}
 }
 
+/** Resolve protocol routing without failing a refresh on invalid settings. */
+function resolveTransportModeSafe(agentDir: string): TransportMode {
+	try {
+		return resolveTransportMode(agentDir);
+	} catch {
+		return DEFAULT_TRANSPORT_MODE;
+	}
+}
+
 function logWarn(message: string): void {
 	console.warn(`[pi-cliproxyapi-provider] ${message}`);
 }
 
 function logInfo(message: string): void {
 	console.info(`[pi-cliproxyapi-provider] ${message}`);
+}
+
+export interface RoutedStreamOptions {
+	providerId: string;
+	transportMode: TransportMode;
+	/** Used when a model carries no baseUrl of its own. */
+	fallbackBaseUrl: string;
+	codexStreamSimple: CliproxyCodexStreamSimple;
+	/** Host pi-ai dispatcher; absent means native routes fall back to Codex. */
+	nativeStreamSimple?: CliproxyCodexStreamSimple;
+	/**
+	 * Fast decision for natively routed requests, evaluated against the model of
+	 * this request. Codex-routed requests keep their own Fast wrapper.
+	 */
+	shouldUseFast?: (model: Model<Api>) => boolean;
+}
+
+/** Add safe debug logging around a native request without touching the payload. */
+function withRouteDiagnostics(route: ModelRoute, streamOptions?: SimpleStreamOptions): SimpleStreamOptions | undefined {
+	if (!isDebugEnabled()) {
+		return streamOptions;
+	}
+	const userOnPayload = streamOptions?.onPayload;
+	const userOnResponse = streamOptions?.onResponse;
+	return {
+		...streamOptions,
+		onPayload: async (payload, payloadModel) => {
+			const outboundToolNames = extractPayloadToolNames(payload);
+			debugLog("native outbound payload", {
+				model: payloadModel.id,
+				api: route.api,
+				outboundTools: outboundToolNames.length,
+				outboundToolNames: outboundToolNames.join(",") || undefined,
+			});
+			return userOnPayload?.(payload, payloadModel);
+		},
+		onResponse: async (response, responseModel) => {
+			debugLog("native response", { model: responseModel.id, api: route.api, status: response.status });
+			await userOnResponse?.(response, responseModel);
+		},
+	};
+}
+
+/**
+ * Dispatch one request to the patched Codex transport or to a pi built-in adapter.
+ *
+ * Every registered model keeps the custom `cliproxyapi-codex-responses` api id so the
+ * extension stream chain (Fast, pause, retry, proactive compaction) stays in place.
+ * Native routes are served by cloning the model with the family-specific api id,
+ * base URL and compat overrides, then calling the host dispatcher.
+ */
+export function createRoutedStreamSimple(options: RoutedStreamOptions): CliproxyCodexStreamSimple {
+	const { providerId, transportMode, fallbackBaseUrl, codexStreamSimple, nativeStreamSimple, shouldUseFast } = options;
+	let missingNativeWarned = false;
+
+	return (model, context, streamOptions) => {
+		if (model.provider !== providerId) {
+			return codexStreamSimple(model, context, streamOptions);
+		}
+
+		let route: ModelRoute | undefined;
+		try {
+			route = resolveModelRoute(model.id, transportMode, model.baseUrl?.trim() ? model.baseUrl : fallbackBaseUrl);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			logWarn(`failed to resolve protocol route for ${model.id} (${message}); using the Codex transport.`);
+			return codexStreamSimple(model, context, streamOptions);
+		}
+
+		if (!route.native) {
+			// The base URL is never logged: a configured URL can carry userinfo or query tokens.
+			debugLog("selected route", {
+				model: model.id,
+				family: route.family,
+				api: CLIPROXYAPI_CODEX_API,
+				transportMode,
+			});
+			return codexStreamSimple(model, context, streamOptions);
+		}
+
+		if (!nativeStreamSimple) {
+			if (!missingNativeWarned) {
+				missingNativeWarned = true;
+				logWarn("host pi-ai stream dispatcher is unavailable; native routes fall back to the Codex transport.");
+			}
+			return codexStreamSimple(model, context, streamOptions);
+		}
+
+		// The base URL is never logged: a configured URL can carry userinfo or query tokens.
+		debugLog("selected route", {
+			model: model.id,
+			family: route.family,
+			api: route.api,
+			transportMode,
+		});
+
+		const nativeModel = {
+			...model,
+			api: route.api as Api,
+			baseUrl: route.baseUrl,
+			...(route.compat ? { compat: route.compat as Model<Api>["compat"] } : {}),
+		} as Model<Api>;
+
+		// Fast is decided here, where the requested model and its route are both known.
+		const baseOptions = withRouteDiagnostics(route, streamOptions);
+		const nativeOptions = shouldUseFast?.(model)
+			? {
+					...baseOptions,
+					onPayload: (payload: unknown, payloadModel: Model<Api>) =>
+						applyFastPayloadHook(payload, payloadModel, baseOptions?.onPayload),
+				}
+			: baseOptions;
+
+		return nativeStreamSimple(nativeModel, context, nativeOptions);
+	};
+}
+
+/** True when this model id is served by a pi built-in adapter in the active mode. */
+export function isNativeRoutedModel(model: Model<Api>, transportMode: TransportMode, fallbackBaseUrl: string): boolean {
+	try {
+		return resolveModelRoute(model.id, transportMode, model.baseUrl?.trim() ? model.baseUrl : fallbackBaseUrl).native;
+	} catch {
+		return false;
+	}
 }
 
 const COMPAT_COORDINATOR_KEY = Symbol.for("pi-cliproxyapi-provider.compat-coordinator");
@@ -105,6 +252,9 @@ interface CompatRegistrationEntry {
 	providerId: string;
 	rawStream: CliproxyCodexStreamSimple;
 	rawStreamSimple: CliproxyCodexStreamSimple;
+	/** Protocol-routed variants used by the compat dispatcher. */
+	routedStream: CliproxyCodexStreamSimple;
+	routedStreamSimple: CliproxyCodexStreamSimple;
 }
 
 interface CompatCoordinator {
@@ -238,6 +388,7 @@ async function configureAndRegister(options: {
 		fastMode: fastMode.isEnabled(),
 		signal: refresh.signal,
 		shouldCommit: () => refreshCoordinator.isCurrent(refresh.generation),
+		transportMode: resolveTransportModeSafe(agentDir),
 	});
 	if (!refreshCoordinator.isCurrent(refresh.generation)) {
 		throw new Error("Model refresh was superseded by a newer request.");
@@ -359,9 +510,12 @@ function createOAuthHandlers(options: {
 				return models;
 			}
 			try {
-				const { inferenceBaseUrl } = resolveEndpoints(meta.baseUrl);
+				// Recompute the endpoint that matches each model's own api id instead of
+				// forcing every model onto /backend-api/.
 				return models.map((model) =>
-					model.provider === providerId ? { ...model, baseUrl: inferenceBaseUrl } : model,
+					model.provider === providerId
+						? { ...model, baseUrl: resolveProtocolBaseUrl(model.api, meta.baseUrl) }
+						: model,
 				);
 			} catch {
 				return models;
@@ -484,17 +638,20 @@ export function registerFastCommand(options: {
 	agentDir: string;
 	providerId: string;
 	fastMode: FastModeController;
+	/** Defaults to /fast, or /cliproxyapi-fast on hosts that already own /fast. */
+	commandName?: string;
 	onStatusChange?: (ctx: ExtensionContext) => void;
 	onModeChange?: (enabled: boolean, ctx: ExtensionContext) => Promise<void>;
 }): void {
 	const { pi, agentDir, providerId, fastMode, onStatusChange, onModeChange } = options;
+	const commandName = options.commandName ?? resolveFastCommandName();
 	let modeChangeInProgress = false;
 
-	pi.registerCommand("fast", {
+	pi.registerCommand(commandName, {
 		description: "Toggle CLIProxyAPI Fast mode globally.",
 		handler: async (args, ctx) => {
 			if (args.trim()) {
-				ctx.ui.notify("Usage: /fast", "error");
+				ctx.ui.notify(`Usage: /${commandName}`, "error");
 				return;
 			}
 			if (modeChangeInProgress) {
@@ -610,6 +767,7 @@ export function registerRefreshCommand(options: {
 						fastMode: fastMode.isEnabled(),
 						signal: refresh?.signal,
 						shouldCommit: refresh ? () => refreshCoordinator?.isCurrent(refresh.generation) ?? true : undefined,
+						transportMode: resolveTransportModeSafe(agentDir),
 					});
 					if (refresh && !refreshCoordinator?.isCurrent(refresh.generation)) return;
 					fastMode.setSupportedModelIds(loaded.fastModelIds);
@@ -644,9 +802,27 @@ export { CLIPROXYAPI_CODEX_API } from "./codex-stream.ts";
 export { resolveEndpoints, toPiModel } from "./lib.ts";
 
 export default async function (pi: ExtensionAPI): Promise<void> {
-	const agentDir = getAgentDir();
+	// Resolve the host once: a non-empty PRIME_AGENT_CODING_AGENT_DIR wins, otherwise the
+	// plugin-local agent directory decides (a default Prime run resolves ~/.prime/agent
+	// without exporting the override env var).
+	const fallbackAgentDir = getAgentDir();
+	const agentDir = resolveAgentDir(() => fallbackAgentDir);
+	const primeHost = isPrimeHost(agentDir);
 	const identity = resolveIdentity(agentDir);
 	const defaultBaseUrl = resolveDefaultBaseUrl(agentDir, identity.providerId);
+
+	let transportMode: TransportMode = DEFAULT_TRANSPORT_MODE;
+	try {
+		transportMode = resolveTransportMode(agentDir);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		logWarn(`invalid transport mode configuration (${message}); using transportMode=${DEFAULT_TRANSPORT_MODE}`);
+	}
+	debugLog("resolved settings", {
+		providerId: identity.providerId,
+		transportMode,
+		primeHost,
+	});
 
 	let pauseEnabled = false;
 	try {
@@ -672,13 +848,41 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const fastMode = new FastModeController(fastEnabled);
 	const modelRefreshCoordinator = new ModelRefreshCoordinator();
 
+	// The router uses this for native requests; the Codex wrapper uses the same
+	// predicate only when Codex is actually called, including native-dispatch fallback.
+	const shouldUseFastForRequest = (model: Model<Api>): boolean =>
+		model.provider === identity.providerId && fastMode.isEffectiveFor(model.id);
+
 	let streamSimple: CliproxyCodexStreamSimple;
 	try {
 		const streams = await loadCliproxyCodexStreams([identity.providerId, "cliproxyapi"], {
-			shouldUseFast: (model) => model.provider === identity.providerId && fastMode.isEffectiveFor(model.id),
+			shouldUseFast: shouldUseFastForRequest,
 		});
 		proactiveCompaction.setCloseWebSocketSessions(streams.closeOpenAICodexWebSocketSessions);
-		streamSimple = proactiveCompaction.wrapStreamSimple(streams.streamSimple);
+
+		const hostNativeStreams: HostNativeStreams =
+			transportMode === "codex" ? {} : await loadHostNativeStreams({ primeHost });
+		if (transportMode !== "codex" && !hostNativeStreams.streamSimple) {
+			logWarn(
+				"host pi-ai stream dispatcher is unavailable; every model stays on the Codex transport " +
+					"(set transportMode=codex to silence this).",
+			);
+		}
+		debugLog("native dispatcher", {
+			transportMode,
+			source: hostNativeStreams.source,
+			available: Boolean(hostNativeStreams.streamSimple),
+		});
+
+		const routedStreamSimple = createRoutedStreamSimple({
+			providerId: identity.providerId,
+			transportMode,
+			fallbackBaseUrl: defaultBaseUrl,
+			codexStreamSimple: streams.streamSimple,
+			nativeStreamSimple: hostNativeStreams.streamSimple,
+			shouldUseFast: shouldUseFastForRequest,
+		});
+		streamSimple = proactiveCompaction.wrapStreamSimple(routedStreamSimple);
 
 		pi.on("session_shutdown", () => {
 			try {
@@ -689,77 +893,97 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			}
 		});
 
-		try {
-			const { registerApiProvider, unregisterApiProviders } = await import("@earendil-works/pi-ai/compat");
+		// Prime Agent 0.9.5 does not expose the @earendil-works/pi-ai/compat subpath to
+		// plugins, so the compat api registration is skipped there.
+		if (primeHost) {
+			debugLog("compat registration skipped", { reason: "prime-host" });
+		} else {
+			try {
+				const { registerApiProvider, unregisterApiProviders } = await import("@earendil-works/pi-ai/compat");
 
-			const coordinator = getCompatCoordinator();
-			const instanceId = `${identity.providerId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+				const coordinator = getCompatCoordinator();
+				const instanceId = `${identity.providerId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-			const entry: CompatRegistrationEntry = {
-				instanceId,
-				providerId: identity.providerId,
-				rawStream: streams.rawStream,
-				rawStreamSimple: streams.rawStreamSimple,
-			};
+				const entry: CompatRegistrationEntry = {
+					instanceId,
+					providerId: identity.providerId,
+					rawStream: streams.rawStream,
+					rawStreamSimple: streams.rawStreamSimple,
+					routedStream: createRoutedStreamSimple({
+						providerId: identity.providerId,
+						transportMode,
+						fallbackBaseUrl: defaultBaseUrl,
+						codexStreamSimple: streams.rawStream,
+						nativeStreamSimple: hostNativeStreams.stream,
+					}),
+					routedStreamSimple: createRoutedStreamSimple({
+						providerId: identity.providerId,
+						transportMode,
+						fallbackBaseUrl: defaultBaseUrl,
+						codexStreamSimple: streams.rawStreamSimple,
+						nativeStreamSimple: hostNativeStreams.streamSimple,
+					}),
+				};
 
-			coordinator.stack.push(entry);
+				coordinator.stack.push(entry);
 
-			const dispatchStream: CliproxyCodexStreamSimple = (model, context, options) => {
-				const active = findActiveCompatEntry(coordinator.stack, model.provider);
-				if (!active) {
-					throw new Error(
-						`No active provider stream handler registered for provider: ${model.provider} (api: ${CLIPROXYAPI_CODEX_API})`,
-					);
-				}
-				const shouldFast = (options as any)?.serviceTier === "priority" || (options as any)?.fast === true;
-				if (shouldFast) {
-					return active.rawStream(model, context, {
+				const withExplicitFast = (options?: SimpleStreamOptions): SimpleStreamOptions | undefined => {
+					const requested = options as { serviceTier?: string; fast?: boolean } | undefined;
+					if (requested?.serviceTier !== "priority" && requested?.fast !== true) {
+						return options;
+					}
+					return {
 						...options,
 						onPayload: (payload, payloadModel) => applyFastPayloadHook(payload, payloadModel, options?.onPayload),
-					});
-				}
-				return active.rawStream(model, context, options);
-			};
+					};
+				};
 
-			const dispatchStreamSimple: CliproxyCodexStreamSimple = (model, context, options) => {
-				const active = findActiveCompatEntry(coordinator.stack, model.provider);
-				if (!active) {
-					throw new Error(
-						`No active provider streamSimple handler registered for provider: ${model.provider} (api: ${CLIPROXYAPI_CODEX_API})`,
-					);
-				}
-				const shouldFast = (options as any)?.serviceTier === "priority" || (options as any)?.fast === true;
-				if (shouldFast) {
-					return active.rawStreamSimple(model, context, {
-						...options,
-						onPayload: (payload, payloadModel) => applyFastPayloadHook(payload, payloadModel, options?.onPayload),
-					});
-				}
-				return active.rawStreamSimple(model, context, options);
-			};
+				const dispatchStream: CliproxyCodexStreamSimple = (model, context, options) => {
+					const active = findActiveCompatEntry(coordinator.stack, model.provider);
+					if (!active) {
+						throw new Error(
+							`No active provider stream handler registered for provider: ${model.provider} (api: ${CLIPROXYAPI_CODEX_API})`,
+						);
+					}
+					return active.routedStream(model, context, withExplicitFast(options));
+				};
 
-			unregisterApiProviders(COMPAT_SOURCE_ID);
-			registerApiProvider(
-				{
-					api: CLIPROXYAPI_CODEX_API,
-					stream: dispatchStream as StreamFunction<typeof CLIPROXYAPI_CODEX_API>,
-					streamSimple: dispatchStreamSimple as StreamFunction<typeof CLIPROXYAPI_CODEX_API, SimpleStreamOptions>,
-				},
-				COMPAT_SOURCE_ID,
-			);
+				const dispatchStreamSimple: CliproxyCodexStreamSimple = (model, context, options) => {
+					const active = findActiveCompatEntry(coordinator.stack, model.provider);
+					if (!active) {
+						throw new Error(
+							`No active provider streamSimple handler registered for provider: ${model.provider} (api: ${CLIPROXYAPI_CODEX_API})`,
+						);
+					}
+					return active.routedStreamSimple(model, context, withExplicitFast(options));
+				};
 
-			pi.on("session_shutdown", () => {
-				const index = coordinator.stack.findIndex((item) => item.instanceId === instanceId);
-				if (index !== -1) {
-					coordinator.stack.splice(index, 1);
-				}
-				if (coordinator.stack.length === 0) {
-					unregisterApiProviders(COMPAT_SOURCE_ID);
-				}
-			});
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			logWarn(`failed to register compat API provider: ${message}`);
+				unregisterApiProviders(COMPAT_SOURCE_ID);
+				registerApiProvider(
+					{
+						api: CLIPROXYAPI_CODEX_API,
+						stream: dispatchStream as StreamFunction<typeof CLIPROXYAPI_CODEX_API>,
+						streamSimple: dispatchStreamSimple as StreamFunction<
+							typeof CLIPROXYAPI_CODEX_API,
+							SimpleStreamOptions
+						>,
+					},
+					COMPAT_SOURCE_ID,
+				);
+
+				pi.on("session_shutdown", () => {
+					const index = coordinator.stack.findIndex((item) => item.instanceId === instanceId);
+					if (index !== -1) {
+						coordinator.stack.splice(index, 1);
+					}
+					if (coordinator.stack.length === 0) {
+						unregisterApiProviders(COMPAT_SOURCE_ID);
+					}
+				});
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				logWarn(`failed to register compat API provider: ${message}`);
+			}
 		}
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
@@ -779,6 +1003,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		agentDir,
 		providerId: identity.providerId,
 		fastMode,
+		commandName: resolveFastCommandName({ primeHost }),
 		onStatusChange: (ctx) => fastFooter.refresh(ctx),
 		onModeChange: onFastModeChange,
 	});
@@ -814,6 +1039,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 					fastMode: fastMode.isEnabled(),
 					signal: refresh.signal,
 					shouldCommit: () => modelRefreshCoordinator.isCurrent(refresh.generation),
+					transportMode,
 				},
 			);
 			if (!modelRefreshCoordinator.isCurrent(refresh.generation)) return undefined;

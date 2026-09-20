@@ -8,8 +8,8 @@ Pi provider extension that discovers models from [CLIProxyAPI](https://github.co
 2. Interactive setup collects `baseUrl` + `apiKey` via `/login CLIProxyAPI` or `/login cliproxyapi`.
 3. Fetches `{root}/v1/models?client_version=pi`.
 4. Maps the CLIProxyAPI catalog into pi models, including Fast service-tier capability.
-5. Registers inference against `{root}/backend-api/`.
-6. Provides `/fast` to toggle OpenAI priority processing for supported models.
+5. Routes each request to the protocol that matches the model family (`transportMode`, default `auto`): GPT and Grok use `{root}/v1`, Claude uses `{root}`, Gemini uses `{root}/v1beta`, and everything else stays on the Codex transport `{root}/backend-api/`.
+6. Provides `/fast` to toggle OpenAI priority processing for supported models (`/cliproxyapi-fast` on hosts that already own `/fast`).
 7. Caches the model catalog in `~/.pi/agent/cliproxyapi-models.json`, refreshes it in the background on startup, and provides `/cliproxyapi-refresh` to force a refresh.
 8. In interactive TUI sessions, shows footer elapsed time during runs and a TPS / token usage toast when the agent settles.
 9. After compaction, closes the reused Codex WebSocket for that session so CLIProxyAPI's server-side context resets with the compacted client messages.
@@ -86,7 +86,8 @@ You can still configure without `/login`.
   "baseUrl": "http://127.0.0.1:8317",
   "apiKey": "12345",
   "fast": false,
-  "pause": false
+  "pause": false,
+  "transportMode": "auto"
 }
 ```
 
@@ -100,6 +101,7 @@ Optional fields:
 | `providerName` | `CLIProxyAPI` | Display name in `/login` and UI |
 | `fast` | `false` | Persisted Fast mode preference; only applies to catalog-supported models |
 | `pause` | `false` | Persisted request-pause preference; provider requests wait until it is cleared |
+| `transportMode` | `auto` | Protocol routing: `auto`, `native` or `codex`. See [Protocol routing](#protocol-routing-transportmode) |
 
 ### Environment overrides
 
@@ -110,6 +112,15 @@ Optional fields:
 | `CLIPROXYAPI_PROVIDER_ID` | `providerId` |
 | `CLIPROXYAPI_PROVIDER_NAME` | `providerName` |
 | `CLIPROXYAPI_FAST` | `fast` (`true` / `false`, also accepts `1`, `0`, `yes`, `no`, `on`, `off`) |
+| `CLIPROXYAPI_TRANSPORT_MODE` | `transportMode` (`auto` / `native` / `codex`) |
+| `CLIPROXYAPI_DEBUG` | Opt-in debug logging (`true` / `false`, same boolean forms as `CLIPROXYAPI_FAST`) |
+
+Two more variables only affect the Codex transport and are documented in [Codex transport](#codex-transport-cliproxyapi_transport):
+
+| Variable | Purpose |
+| ---------- | --------- |
+| `CLIPROXYAPI_TRANSPORT` | Codex wire transport: `auto`, `websocket` or `sse` |
+| `CLIPROXYAPI_WS_IDLE_TTL_MS` | Idle lifetime of a cached Codex WebSocket session |
 
 Resolution order for connection settings:
 
@@ -131,7 +142,7 @@ Preferred form is **host:port only**:
 | `http://127.0.0.1:8317/v1` | `http://127.0.0.1:8317/backend-api/` | same models URL |
 | `127.0.0.1:8317` | `http://127.0.0.1:8317/backend-api/` | same models URL |
 
-pi then sends inference traffic to `{inference}/codex/responses`.
+With `transportMode: "codex"` pi then sends inference traffic to `{inference}/codex/responses`. In `auto` (default) and `native` modes, GPT/Grok/Claude/Gemini models instead use the native endpoint of their family; see [Protocol routing](#protocol-routing-transportmode).
 
 ## Fast mode
 
@@ -143,11 +154,86 @@ Fast is **off by default**. Toggle the global preference with:
 /fast
 ```
 
+On hosts that already provide a `/fast` command (for example Prime Agent), the provider registers `/cliproxyapi-fast` instead. Fast injection works for both Codex-routed and natively routed models.
+
 Each invocation switches Fast between on and off and writes the result to `~/.pi/agent/cliproxyapi.json`. On the next startup, a persisted `true` value immediately enables Fast for catalog-supported models. Fast remains ineffective for unsupported models, so their requests are left unchanged. If `CLIPROXYAPI_FAST` is set, that environment variable still takes precedence on startup.
 
 When Fast is effective, pi's model status appends a yellow lowercase `fast`, for example `gpt-5.6-sol • xhigh • fast`. When Fast is off or the selected model is unsupported, the original model status remains unchanged. Supported models do not produce a separate status notification. Running `/fast` with an unsupported model still updates the global preference; enabling it warns that the current model cannot use Fast.
 
 Fast capability is catalog-driven: the plugin considers a CLIProxyAPI model Fast-capable when its `service_tiers` field is a non-empty array. The `additional_speed_tiers` field is ignored. For supported models, Fast injects `service_tier: "priority"`; unsupported models are left unchanged. Fast is independent from pi's reasoning/thinking level. When `models.dev` provides `experimental.modes.fast.cost`, the registered model cost switches to those Fast rates as well; the provider is refreshed when `/fast` is toggled. If no Fast price is published, the standard price is retained. The plugin does not guess Fast prices from `-pro`/`-fast` model IDs.
+
+## Protocol routing (transportMode)
+
+CLIProxyAPI exposes one native endpoint per model family. `transportMode` selects which protocol this plugin uses for each model. The model id is always sent unchanged; a route prefix such as `relay-apikeyfun/claude-sonnet-5` is only used to detect the family.
+
+| Mode | GPT `gpt-*` | Grok `grok-*` | Claude `claude-*`, `*/claude-*` | Gemini `gemini-*` | Other ids |
+| ------ | ------------- | --------------- | --------------------------------- | ------------------- | ----------- |
+| `auto` (default) | `openai-responses` → `{root}/v1` | `openai-responses` → `{root}/v1` | `anthropic-messages` → `{root}` | `google-generative-ai` → `{root}/v1beta` | Codex → `{root}/backend-api/` |
+| `native` | same as `auto` | same as `auto` | same as `auto` | same as `auto` | `openai-completions` → `{root}/v1` |
+| `codex` | Codex → `{root}/backend-api/` | Codex | Codex | Codex | Codex |
+
+Details:
+
+- Every registered model keeps the custom api id `cliproxyapi-codex-responses`, so Fast, `/pause`, retry normalization and proactive compaction stay active for native routes as well. The provider picks the real protocol per request and hands native routes to pi's built-in adapter.
+- Claude routes are registered with `compat.supportsEagerToolInputStreaming = false`, because CLIProxyAPI does not accept per-tool `eager_input_streaming`.
+- `auto` keeps unknown model ids on the Codex transport. Use `native` only when the proxy serves every model over an OpenAI-compatible endpoint.
+- If the host does not expose the pi-ai stream dispatcher, native routes fall back to the Codex transport and a warning is logged.
+
+### Rollback
+
+Set the mode back to the previous behavior at any time:
+
+```json
+{ "transportMode": "codex" }
+```
+
+or
+
+```bash
+export CLIPROXYAPI_TRANSPORT_MODE=codex
+```
+
+`codex` reproduces the pre-routing behavior exactly: every model uses the patched Codex responses transport at `{root}/backend-api/`.
+
+## Codex transport (CLIPROXYAPI_TRANSPORT)
+
+`CLIPROXYAPI_TRANSPORT` is **not** related to `transportMode`. It only selects the wire transport **inside** the Codex protocol:
+
+| Value | Behavior |
+| ------- | ---------- |
+| `auto` (default) | Try the persistent WebSocket, fall back to SSE when the connection cannot be started |
+| `websocket` | Force the WebSocket transport |
+| `sse` | Force plain SSE |
+
+A failed WebSocket connection is retried a finite number of times (up to `maxRetries`, capped at 5). If the stream has not started yet, the request falls back to SSE and records a transport diagnostic; once events have been emitted the error is raised instead of silently restarting. `CLIPROXYAPI_WS_IDLE_TTL_MS` overrides the idle lifetime of a cached WebSocket session (default 30 minutes).
+
+Summary: `transportMode` picks the **protocol and endpoint**; `CLIPROXYAPI_TRANSPORT` picks **websocket or SSE** inside the Codex protocol.
+
+## Debug logging
+
+Set `CLIPROXYAPI_DEBUG=true` to print one line per routing decision and per request:
+
+- selected model, family, api id and `transportMode`
+- context tool count and tool names for Codex requests
+- outbound payload tool count and tool names
+- response HTTP status
+
+The log never contains API keys, credentials, prompt text, tool arguments or request/response bodies. Debug logging is off by default.
+
+### Tool retention guard
+
+When a context declares tools but the outbound Codex payload contains none, the request is rejected with an explicit error instead of being sent. A tool-less request looks successful and then ends the turn after one message, which is much harder to diagnose.
+
+## Prime Agent hosts
+
+The extension also runs inside Prime Agent hosts, which differ from Pi in a few ways:
+
+- Host detection uses two signals: a non-empty `PRIME_AGENT_CODING_AGENT_DIR`, or a resolved agent directory that ends with `.prime/agent`. A default Prime run does not always export the env var.
+- A non-empty `PRIME_AGENT_CODING_AGENT_DIR` is used as the agent directory, so `cliproxyapi.json`, `auth.json` and the model cache are read from the Prime agent directory.
+- Prime Agent already owns `/fast`, so the provider registers `/cliproxyapi-fast` instead. `/pause`, `/continue` and `/cliproxyapi-refresh` keep their names.
+- The `@earendil-works/pi-ai/compat` subpath does not exist on Prime Agent 0.9.5, so the compat api registration is skipped there. The provider stream chain is unaffected.
+- The credential in `auth.json` is parsed directly instead of importing the host `readStoredCredential` helper.
+- `~/.prime/agent/npm` is probed when the Codex protocol module is resolved.
 
 ## Pausing provider requests
 
@@ -171,13 +257,13 @@ The provider keeps a separate cache file so startup stays fast when CLIProxyAPI 
 
 `~/.pi/agent/cliproxyapi-models.json`
 
-The cache stores only model metadata and derived endpoint URLs — the model list, Fast-capable IDs, `inferenceBaseUrl`, `modelsUrl`, and a `fetchedAt` timestamp. It **never** stores your API key or other credentials.
+The cache stores only model metadata and derived endpoint URLs — the model list, Fast-capable IDs, `inferenceBaseUrl`, `modelsUrl`, the `transportMode` it was mapped for, and a `fetchedAt` timestamp. It **never** stores your API key or other credentials. A cache written for a different `transportMode` is discarded and refetched.
 
 | Property | Value |
 |----------|-------|
 | Cache file | `~/.pi/agent/cliproxyapi-models.json` |
 | Remote query timeout | 60 seconds |
-| Scope | tied to the current `baseUrl` (a different base URL ignores the existing cache) |
+| Scope | tied to the current `baseUrl` and `transportMode` (a different base URL or mode ignores the existing cache) |
 
 ### Startup / resume behavior
 

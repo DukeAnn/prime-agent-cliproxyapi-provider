@@ -25,6 +25,10 @@ const CLIPROXYAPI_ENV_NAMES = [
 	"CLIPROXYAPI_FAST",
 	"CLIPROXYAPI_PROVIDER_ID",
 	"CLIPROXYAPI_PROVIDER_NAME",
+	"CLIPROXYAPI_TRANSPORT_MODE",
+	"CLIPROXYAPI_DEBUG",
+	// Keep these cases on the Pi host path even when the suite runs inside Prime Agent.
+	"PRIME_AGENT_CODING_AGENT_DIR",
 ] as const;
 
 function createModel(id: string): PiProviderModel {
@@ -230,6 +234,52 @@ describe("resolveMappedModels cache behavior", () => {
 			expect(result.fromCache).toBe(true);
 			expect(result.loaded.models).toEqual(cached.models);
 			expect(result.loaded.fastModelIds).toEqual(["fast-cached"]);
+		} finally {
+			fetchMock.mockRestore();
+		}
+	});
+
+	it("does not use a cache generated for a different transport mode", async () => {
+		const agentDir = tempAgentDir();
+		const cached = createMappedModels({ models: [createModel("cached-codex")] });
+		saveModelsCache(agentDir, { ...cached, transportMode: "codex" }, Date.now());
+
+		const fetchMock = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValue(
+				new Response(JSON.stringify({ models: [createCodexModel("remote-auto")] }), { status: 200 }),
+			);
+
+		try {
+			// The cached catalog was mapped for another protocol routing mode.
+			expect(loadModelsCache(agentDir, "http://127.0.0.1:8317", "auto")).toBeNull();
+			expect(loadModelsCache(agentDir, "http://127.0.0.1:8317", "codex")?.models[0]?.id).toBe("cached-codex");
+
+			const result = await resolveMappedModels(agentDir, "http://127.0.0.1:8317", "key", {
+				transportMode: "auto",
+			});
+			expect(result.fromCache).toBe(false);
+			expect(result.loaded.models[0]?.id).toBe("remote-auto");
+			expect(result.loaded.transportMode).toBe("auto");
+			expect(loadModelsCache(agentDir, "http://127.0.0.1:8317", "auto")?.transportMode).toBe("auto");
+		} finally {
+			fetchMock.mockRestore();
+		}
+	});
+
+	it("treats a cache written before transport modes existed as auto", async () => {
+		const agentDir = tempAgentDir();
+		const cached = createMappedModels({ models: [createModel("legacy-cache")] });
+		saveModelsCache(agentDir, cached, Date.now());
+
+		const fetchMock = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("should not fetch"));
+		try {
+			const result = await resolveMappedModels(agentDir, "http://127.0.0.1:8317", "key", {
+				transportMode: "auto",
+			});
+			expect(fetchMock).not.toHaveBeenCalled();
+			expect(result.fromCache).toBe(true);
+			expect(result.loaded.models[0]?.id).toBe("legacy-cache");
 		} finally {
 			fetchMock.mockRestore();
 		}

@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
@@ -17,6 +17,10 @@ const CLIPROXYAPI_ENV_NAMES = [
 	"CLIPROXYAPI_FAST",
 	"CLIPROXYAPI_PROVIDER_ID",
 	"CLIPROXYAPI_PROVIDER_NAME",
+	"CLIPROXYAPI_TRANSPORT_MODE",
+	"CLIPROXYAPI_DEBUG",
+	// Keep these cases on the Pi host path even when the suite runs inside Prime Agent.
+	"PRIME_AGENT_CODING_AGENT_DIR",
 ] as const;
 
 async function withTempAgentDir(run: (agentDir: string) => Promise<void>): Promise<void> {
@@ -572,6 +576,218 @@ describe("pi 0.82.0 compatibility", () => {
 			} finally {
 				spy.mockRestore();
 			}
+		});
+	});
+});
+
+async function withTempPrimeAgentDir(run: (dirs: { primeDir: string; piDir: string }) => Promise<void>): Promise<void> {
+	const primeDir = mkdtempSync(join(tmpdir(), "pi-cliproxyapi-prime-test-"));
+	const piDir = mkdtempSync(join(tmpdir(), "pi-cliproxyapi-pi-test-"));
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const previousEnv = new Map(CLIPROXYAPI_ENV_NAMES.map((name) => [name, process.env[name]]));
+	process.env.PI_CODING_AGENT_DIR = piDir;
+	for (const name of CLIPROXYAPI_ENV_NAMES) delete process.env[name];
+	process.env.PRIME_AGENT_CODING_AGENT_DIR = primeDir;
+
+	try {
+		await run({ primeDir, piDir });
+	} finally {
+		if (previousAgentDir === undefined) {
+			delete process.env.PI_CODING_AGENT_DIR;
+		} else {
+			process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		}
+		for (const [name, value] of previousEnv) {
+			if (value === undefined) {
+				delete process.env[name];
+			} else {
+				process.env[name] = value;
+			}
+		}
+		rmSync(primeDir, { recursive: true, force: true });
+		rmSync(piDir, { recursive: true, force: true });
+	}
+}
+
+describe("Prime Agent host compatibility", () => {
+	afterEach(() => {
+		resetCompatCoordinator();
+		unregisterApiProviders(COMPAT_SOURCE_ID);
+	});
+
+	it("registers /cliproxyapi-fast instead of the host-owned /fast", async () => {
+		await withTempPrimeAgentDir(async () => {
+			const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+			const { pi } = createPiMock(commands);
+
+			await expect(providerExtension(pi)).resolves.toBeUndefined();
+
+			expect(commands.size).toBe(4);
+			expect(commands.has("cliproxyapi-fast")).toBe(true);
+			expect(commands.has("fast")).toBe(false);
+			expect(commands.has("pause")).toBe(true);
+			expect(commands.has("continue")).toBe(true);
+			expect(commands.has("cliproxyapi-refresh")).toBe(true);
+		});
+	});
+
+	it("skips the pi-ai/compat api registration that Prime Agent does not expose", async () => {
+		await withTempPrimeAgentDir(async () => {
+			const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+			const { pi } = createPiMock(commands);
+
+			await providerExtension(pi);
+
+			expect(getApiProvider("cliproxyapi-codex-responses" as Api)).toBeUndefined();
+		});
+	});
+
+	it("detects a Prime host from a ~/.prime/agent directory when the env var is absent", async () => {
+		// Default Prime runs resolve the agent dir through getAgentDir() only.
+		const home = mkdtempSync(join(tmpdir(), "pi-cliproxyapi-prime-home-"));
+		const primeAgentDir = join(home, ".prime", "agent");
+		mkdirSync(primeAgentDir, { recursive: true });
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const previousEnv = new Map(CLIPROXYAPI_ENV_NAMES.map((name) => [name, process.env[name]]));
+		process.env.PI_CODING_AGENT_DIR = primeAgentDir;
+		for (const name of CLIPROXYAPI_ENV_NAMES) delete process.env[name];
+
+		try {
+			expect(process.env.PRIME_AGENT_CODING_AGENT_DIR).toBeUndefined();
+			const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+			const { pi } = createPiMock(commands);
+
+			await providerExtension(pi);
+
+			expect(commands.has("cliproxyapi-fast")).toBe(true);
+			expect(commands.has("fast")).toBe(false);
+			expect(getApiProvider("cliproxyapi-codex-responses" as Api)).toBeUndefined();
+		} finally {
+			if (previousAgentDir === undefined) {
+				delete process.env.PI_CODING_AGENT_DIR;
+			} else {
+				process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			}
+			for (const [name, value] of previousEnv) {
+				if (value === undefined) {
+					delete process.env[name];
+				} else {
+					process.env[name] = value;
+				}
+			}
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps a ~/.pi/agent directory on the Pi host path", async () => {
+		const home = mkdtempSync(join(tmpdir(), "pi-cliproxyapi-pi-home-"));
+		const piAgentDir = join(home, ".pi", "agent");
+		mkdirSync(piAgentDir, { recursive: true });
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const previousEnv = new Map(CLIPROXYAPI_ENV_NAMES.map((name) => [name, process.env[name]]));
+		process.env.PI_CODING_AGENT_DIR = piAgentDir;
+		for (const name of CLIPROXYAPI_ENV_NAMES) delete process.env[name];
+
+		try {
+			const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+			const { pi, handlers } = createPiMock(commands);
+
+			await providerExtension(pi);
+
+			expect(commands.has("fast")).toBe(true);
+			expect(commands.has("cliproxyapi-fast")).toBe(false);
+			expect(getApiProvider("cliproxyapi-codex-responses" as Api)).toBeDefined();
+
+			for (const handler of handlers.get("session_shutdown") ?? []) {
+				handler({}, {} as ExtensionContext);
+			}
+		} finally {
+			if (previousAgentDir === undefined) {
+				delete process.env.PI_CODING_AGENT_DIR;
+			} else {
+				process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			}
+			for (const [name, value] of previousEnv) {
+				if (value === undefined) {
+					delete process.env[name];
+				} else {
+					process.env[name] = value;
+				}
+			}
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
+	it("reads configuration from PRIME_AGENT_CODING_AGENT_DIR, not from the Pi agent dir", async () => {
+		await withTempPrimeAgentDir(async ({ primeDir, piDir }) => {
+			writeFileSync(
+				join(primeDir, "cliproxyapi.json"),
+				JSON.stringify({ baseUrl: "http://127.0.0.1:9999", apiKey: "prime-key" }),
+				"utf8",
+			);
+			writeFileSync(
+				join(piDir, "cliproxyapi.json"),
+				JSON.stringify({ baseUrl: "http://127.0.0.1:8317", apiKey: "pi-key" }),
+				"utf8",
+			);
+
+			const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+			const { pi } = createPiMock(commands);
+			const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+				new Response(JSON.stringify({ models: [{ slug: "gpt-5.6-sol" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			);
+
+			try {
+				await providerExtension(pi);
+
+				const requestedUrls = fetchMock.mock.calls.map((call) => String(call[0]));
+				expect(requestedUrls.some((url) => url.startsWith("http://127.0.0.1:9999/v1/models"))).toBe(true);
+				expect(requestedUrls.some((url) => url.startsWith("http://127.0.0.1:8317"))).toBe(false);
+			} finally {
+				fetchMock.mockRestore();
+			}
+		});
+	});
+});
+
+describe("oauth modifyModels", () => {
+	afterEach(() => {
+		resetCompatCoordinator();
+		unregisterApiProviders(COMPAT_SOURCE_ID);
+	});
+
+	it("recomputes each model base URL from its own api id", async () => {
+		await withTempAgentDir(async () => {
+			const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+			const { pi } = createPiMock(commands);
+
+			await providerExtension(pi);
+
+			const config = (pi.registerProvider as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1] as {
+				oauth: { modifyModels: (models: Model<Api>[], credentials: { refresh: string }) => Model<Api>[] };
+			};
+			const models = [
+				{ id: "gpt-5.6-sol", provider: "cliproxyapi", api: "cliproxyapi-codex-responses", baseUrl: "http://stale" },
+				{ id: "claude-sonnet-5", provider: "cliproxyapi", api: "anthropic-messages", baseUrl: "http://stale" },
+				{ id: "gemini-3-flash", provider: "cliproxyapi", api: "google-generative-ai", baseUrl: "http://stale" },
+				{ id: "gpt-5.6-terra", provider: "cliproxyapi", api: "openai-responses", baseUrl: "http://stale" },
+				{ id: "other", provider: "anthropic", api: "anthropic-messages", baseUrl: "http://keep" },
+			] as unknown as Model<Api>[];
+
+			const updated = config.oauth.modifyModels(models, {
+				refresh: JSON.stringify({ baseUrl: "http://127.0.0.1:8317" }),
+			});
+
+			expect(updated.map((model) => model.baseUrl)).toEqual([
+				"http://127.0.0.1:8317/backend-api/",
+				"http://127.0.0.1:8317",
+				"http://127.0.0.1:8317/v1beta",
+				"http://127.0.0.1:8317/v1",
+				"http://keep",
+			]);
 		});
 	});
 });

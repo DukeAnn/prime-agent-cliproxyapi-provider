@@ -19,6 +19,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { Api, AssistantMessageEventStream, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
+import { debugLog, isPrimeHost } from "./lib.ts";
 
 export const CLIPROXYAPI_CODEX_API = "cliproxyapi-codex-responses" as const;
 
@@ -193,6 +194,86 @@ export function adaptContextForModule(
 	return supportsTranscript ? ensureTranscriptContext(context) : adaptTranscriptContext(context);
 }
 
+function toolNameOf(tool: unknown): string | undefined {
+	if (!tool || typeof tool !== "object") return undefined;
+	const record = tool as Record<string, unknown>;
+	if (typeof record.name === "string" && record.name.trim()) return record.name.trim();
+	const fn = record.function;
+	if (fn && typeof fn === "object" && typeof (fn as Record<string, unknown>).name === "string") {
+		const nested = (fn as Record<string, unknown>).name as string;
+		return nested.trim() || undefined;
+	}
+	return undefined;
+}
+
+/**
+ * Collect the tool names a context declares, in both context shapes.
+ *
+ * Classic contexts declare `context.tools`; pi >=0.86 transcript contexts declare
+ * `toolsAdded` / `toolsRemoved` on system messages. Only names are read, never arguments.
+ */
+export function collectContextToolNames(context: Context | { [key: string]: unknown } | undefined): string[] {
+	if (!context || typeof context !== "object") return [];
+	const names = new Set<string>();
+
+	const tools = (context as { tools?: unknown }).tools;
+	if (Array.isArray(tools)) {
+		for (const tool of tools) {
+			const name = toolNameOf(tool);
+			if (name) names.add(name);
+		}
+	}
+
+	const messages = (context as { messages?: unknown }).messages;
+	if (Array.isArray(messages)) {
+		for (const message of messages as TranscriptMessage[]) {
+			if (!message || typeof message !== "object" || message.role !== "system") continue;
+			if (Array.isArray(message.toolsRemoved)) {
+				for (const tool of message.toolsRemoved) {
+					const name = toolNameOf(tool);
+					if (name) names.delete(name);
+				}
+			}
+			if (Array.isArray(message.toolsAdded)) {
+				for (const tool of message.toolsAdded) {
+					const name = toolNameOf(tool);
+					if (name) names.add(name);
+				}
+			}
+		}
+	}
+
+	return [...names];
+}
+
+/** Read tool names from an outbound provider payload. Arguments are never read. */
+export function extractPayloadToolNames(payload: unknown): string[] {
+	if (!payload || typeof payload !== "object" || Array.isArray(payload)) return [];
+	const tools = (payload as Record<string, unknown>).tools;
+	if (!Array.isArray(tools)) return [];
+	const names: string[] = [];
+	for (const tool of tools) {
+		const name = toolNameOf(tool);
+		if (name) names.push(name);
+	}
+	return names;
+}
+
+/**
+ * Fail loudly when context tools disappear from the outbound Codex payload.
+ *
+ * A tool-less request looks successful but ends the turn after one message,
+ * which is the exact regression this guard protects against.
+ */
+export function assertOutboundToolsRetained(expectedToolNames: string[], payload: unknown): void {
+	if (expectedToolNames.length === 0) return;
+	const actual = extractPayloadToolNames(payload);
+	if (actual.length > 0) return;
+	throw new Error(
+		`Codex payload dropped all ${expectedToolNames.length} context tools (${expectedToolNames.join(", ")}); refusing to send a tool-less request`,
+	);
+}
+
 export function withPriorityServiceTier(payload: unknown): unknown {
 	if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
 		return payload;
@@ -212,6 +293,47 @@ export async function applyFastPayloadHook(
 	const fastPayload = withPriorityServiceTier(payload);
 	const nextPayload = await onPayload?.(fastPayload, model);
 	return nextPayload === undefined ? fastPayload : nextPayload;
+}
+
+/**
+ * Add the tool-retention guard and safe debug logging to a Codex request.
+ *
+ * The returned options keep any caller `onPayload` / `onResponse` hook and only
+ * observe metadata: tool names, tool counts and the response HTTP status.
+ */
+export function withCodexToolGuard(
+	context: Context | { [key: string]: unknown } | undefined,
+	model: Model<Api>,
+	streamOptions?: SimpleStreamOptions,
+): SimpleStreamOptions | undefined {
+	const expectedToolNames = collectContextToolNames(context);
+	debugLog("codex request context", {
+		model: model.id,
+		provider: model.provider,
+		contextTools: expectedToolNames.length,
+		contextToolNames: expectedToolNames.join(",") || undefined,
+	});
+
+	const userOnPayload = streamOptions?.onPayload;
+	const userOnResponse = streamOptions?.onResponse;
+
+	return {
+		...streamOptions,
+		onPayload: async (payload, payloadModel) => {
+			assertOutboundToolsRetained(expectedToolNames, payload);
+			const outboundToolNames = extractPayloadToolNames(payload);
+			debugLog("codex outbound payload", {
+				model: payloadModel.id,
+				outboundTools: outboundToolNames.length,
+				outboundToolNames: outboundToolNames.join(",") || undefined,
+			});
+			return userOnPayload?.(payload, payloadModel);
+		},
+		onResponse: async (response, responseModel) => {
+			debugLog("codex response", { model: responseModel.id, status: response.status });
+			await userOnResponse?.(response, responseModel);
+		},
+	};
 }
 
 export function wrapStreamSimpleForFast(
@@ -282,6 +404,18 @@ export function wellKnownCodexModuleCandidates(homeDirectory: string): string[] 
 		join(
 			homeDirectory,
 			".pi",
+			"agent",
+			"npm",
+			"node_modules",
+			"@earendil-works",
+			"pi-coding-agent",
+			CODEX_MODULE_RELATIVE,
+		),
+		// Prime Agent keeps plugin dependencies under ~/.prime/agent/npm.
+		join(homeDirectory, ".prime", "agent", "npm", CODEX_MODULE_RELATIVE),
+		join(
+			homeDirectory,
+			".prime",
 			"agent",
 			"npm",
 			"node_modules",
@@ -543,6 +677,46 @@ export function resolveOriginalCodexModulePath(options: ResolveOriginalCodexModu
 	throw new Error(`Cannot resolve openai-codex-responses.js (tried: ${candidates.join(", ") || "none"})`);
 }
 
+export interface HostNativeStreams {
+	stream?: CliproxyCodexStreamSimple;
+	streamSimple?: CliproxyCodexStreamSimple;
+	source?: string;
+}
+
+/**
+ * Resolve the host pi-ai `stream` / `streamSimple` dispatchers used for native routes.
+ *
+ * The bare specifier is tried first: Pi and Prime Agent both map it to the
+ * dispatching entrypoint. The `/compat` subpath is only tried off Prime, because
+ * Prime Agent 0.9.5 does not expose that subpath to plugins.
+ *
+ * @param options.primeHost - Override host detection (tests).
+ * @returns The host dispatchers, or an empty object when none can be resolved.
+ */
+export async function loadHostNativeStreams(options: { primeHost?: boolean } = {}): Promise<HostNativeStreams> {
+	const primeHost = options.primeHost ?? isPrimeHost();
+	const specifiers = primeHost ? ["@earendil-works/pi-ai"] : ["@earendil-works/pi-ai", "@earendil-works/pi-ai/compat"];
+
+	for (const specifier of specifiers) {
+		try {
+			const mod = (await import(specifier)) as {
+				stream?: unknown;
+				streamSimple?: unknown;
+			};
+			if (typeof mod.stream === "function" && typeof mod.streamSimple === "function") {
+				return {
+					stream: mod.stream as CliproxyCodexStreamSimple,
+					streamSimple: mod.streamSimple as CliproxyCodexStreamSimple,
+					source: specifier,
+				};
+			}
+		} catch {
+			// Try the next specifier; host packaging differs between Pi and Prime Agent.
+		}
+	}
+	return {};
+}
+
 export async function loadCliproxyCodexStreams(
 	providerIds: string[] = ["cliproxyapi"],
 	options: CliproxyCodexStreamOptions = {},
@@ -583,10 +757,12 @@ export async function loadCliproxyCodexStreams(
 	const adaptContext = (context: Context): Context => adaptContextForModule(context, supportsTranscript);
 
 	const adaptedStreamSimple: CliproxyCodexStreamSimple = (model, context, streamOptions) => {
-		return mod.streamSimple(model, adaptContext(context), streamOptions);
+		const adapted = adaptContext(context);
+		return mod.streamSimple(model, adapted, withCodexToolGuard(context, model, streamOptions));
 	};
 	const adaptedStream: CliproxyCodexStreamSimple = (model, context, streamOptions) => {
-		return mod.stream(model, adaptContext(context), streamOptions);
+		const adapted = adaptContext(context);
+		return mod.stream(model, adapted, withCodexToolGuard(context, model, streamOptions));
 	};
 
 	const streamSimple = wrapStreamSimpleForFast(adaptedStreamSimple, options.shouldUseFast);

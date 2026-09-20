@@ -13,20 +13,30 @@ import {
 	DEFAULT_MAX_TOKENS,
 	DEFAULT_PROVIDER_ID,
 	DEFAULT_PROVIDER_NAME,
+	DEFAULT_TRANSPORT_MODE,
+	debugLog,
 	decodeRefreshMeta,
 	encodeRefreshMeta,
 	extractReasoningEfforts,
 	fetchModelsDevCostMap,
 	firstNonEmpty,
+	isDebugEnabled,
+	isPrimeAgentDirPath,
+	isPrimeHost,
 	isUnauthorizedModelsError,
 	loadAuthConnection,
 	loadConfigFile,
 	ModelsHttpError,
 	matchModelCost,
 	parseBooleanSetting,
+	parseTransportMode,
+	readAuthCredential,
+	resolveAgentDir,
 	resolveEndpoints,
+	resolveFastCommandName,
 	resolveFastDefault,
 	resolveIdentity,
+	resolveTransportMode,
 	saveConfigFile,
 	supportsFastServiceTier,
 	toPiModel,
@@ -67,6 +77,7 @@ describe("resolveEndpoints", () => {
 			inferenceBaseUrl: "http://127.0.0.1:8317/backend-api/",
 			modelsUrl: "http://127.0.0.1:8317/v1/models?client_version=pi",
 			rootOrigin: "http://127.0.0.1:8317",
+			rootBaseUrl: "http://127.0.0.1:8317",
 		});
 	});
 
@@ -523,5 +534,205 @@ describe("config and auth file helpers", () => {
 			providerName: DEFAULT_PROVIDER_NAME,
 		});
 		expect(DEFAULT_BASE_URL).toBe("http://127.0.0.1:8317");
+	});
+});
+
+describe("transport mode settings", () => {
+	function withEnv(value: string | undefined, run: () => void): void {
+		const previous = process.env.CLIPROXYAPI_TRANSPORT_MODE;
+		if (value === undefined) {
+			delete process.env.CLIPROXYAPI_TRANSPORT_MODE;
+		} else {
+			process.env.CLIPROXYAPI_TRANSPORT_MODE = value;
+		}
+		try {
+			run();
+		} finally {
+			if (previous === undefined) {
+				delete process.env.CLIPROXYAPI_TRANSPORT_MODE;
+			} else {
+				process.env.CLIPROXYAPI_TRANSPORT_MODE = previous;
+			}
+		}
+	}
+
+	it("defaults to auto", () => {
+		const agentDir = tempAgentDir();
+		withEnv(undefined, () => {
+			expect(DEFAULT_TRANSPORT_MODE).toBe("auto");
+			expect(resolveTransportMode(agentDir)).toBe("auto");
+		});
+	});
+
+	it("reads cliproxyapi.json and lets the env var win", () => {
+		const agentDir = tempAgentDir();
+		saveConfigFile(agentDir, { transportMode: "codex" });
+		withEnv(undefined, () => {
+			expect(resolveTransportMode(agentDir)).toBe("codex");
+		});
+		withEnv("Native", () => {
+			expect(resolveTransportMode(agentDir)).toBe("native");
+		});
+	});
+
+	it("rejects unknown values from env and config", () => {
+		const agentDir = tempAgentDir();
+		withEnv("websocket", () => {
+			expect(() => resolveTransportMode(agentDir)).toThrow(/CLIPROXYAPI_TRANSPORT_MODE must be one of/);
+		});
+		saveConfigFile(agentDir, { transportMode: "sse" as never });
+		withEnv(undefined, () => {
+			expect(() => resolveTransportMode(agentDir)).toThrow(/transportMode/);
+		});
+	});
+
+	it("parses mode names case-insensitively", () => {
+		expect(parseTransportMode(" AUTO ")).toBe("auto");
+		expect(parseTransportMode("native")).toBe("native");
+		expect(parseTransportMode("codex")).toBe("codex");
+		expect(parseTransportMode("sse")).toBeUndefined();
+	});
+});
+
+describe("Prime Agent host compatibility", () => {
+	function withPrimeDir(value: string | undefined, run: () => void): void {
+		const previous = process.env.PRIME_AGENT_CODING_AGENT_DIR;
+		if (value === undefined) {
+			delete process.env.PRIME_AGENT_CODING_AGENT_DIR;
+		} else {
+			process.env.PRIME_AGENT_CODING_AGENT_DIR = value;
+		}
+		try {
+			run();
+		} finally {
+			if (previous === undefined) {
+				delete process.env.PRIME_AGENT_CODING_AGENT_DIR;
+			} else {
+				process.env.PRIME_AGENT_CODING_AGENT_DIR = previous;
+			}
+		}
+	}
+
+	it("prefers a non-empty PRIME_AGENT_CODING_AGENT_DIR over the plugin-local agent dir", () => {
+		const fallback = vi.fn(() => "/home/user/.pi/agent");
+		withPrimeDir("/home/user/.prime/agent", () => {
+			expect(isPrimeHost()).toBe(true);
+			expect(resolveAgentDir(fallback)).toBe("/home/user/.prime/agent");
+			expect(fallback).not.toHaveBeenCalled();
+		});
+		withPrimeDir("   ", () => {
+			expect(isPrimeHost("/home/user/.pi/agent")).toBe(false);
+			expect(resolveAgentDir(fallback)).toBe("/home/user/.pi/agent");
+		});
+		withPrimeDir(undefined, () => {
+			expect(resolveAgentDir(fallback)).toBe("/home/user/.pi/agent");
+		});
+	});
+
+	it("detects a Prime host from the resolved agent dir when the env var is absent", () => {
+		withPrimeDir(undefined, () => {
+			// Default Prime runs resolve ~/.prime/agent without exporting the override.
+			expect(isPrimeHost("/home/user/.prime/agent")).toBe(true);
+			expect(isPrimeHost("/home/user/.prime/agent/")).toBe(true);
+			expect(isPrimeHost("C:\\Users\\user\\.prime\\agent")).toBe(true);
+			expect(isPrimeHost("/home/user/.pi/agent")).toBe(false);
+			expect(isPrimeHost("/home/user/.prime")).toBe(false);
+			expect(isPrimeHost("/home/user/prime/agent")).toBe(false);
+			expect(isPrimeHost(undefined)).toBe(false);
+			expect(isPrimeHost("   ")).toBe(false);
+		});
+	});
+
+	it("keeps an explicit env signal for custom Prime agent directories", () => {
+		withPrimeDir("/srv/custom-prime-dir", () => {
+			// The env var is the explicit signal, even when the path has no .prime/agent tail.
+			expect(isPrimeHost("/home/user/.pi/agent")).toBe(true);
+			expect(resolveFastCommandName({ agentDir: "/home/user/.pi/agent" })).toBe("cliproxyapi-fast");
+		});
+	});
+
+	it("renames the Fast command on Prime Agent hosts", () => {
+		withPrimeDir("/home/user/.prime/agent", () => {
+			expect(resolveFastCommandName()).toBe("cliproxyapi-fast");
+		});
+		withPrimeDir(undefined, () => {
+			expect(resolveFastCommandName()).toBe("fast");
+			// Deterministic forms used by the extension entrypoint.
+			expect(resolveFastCommandName({ agentDir: "/home/user/.prime/agent" })).toBe("cliproxyapi-fast");
+			expect(resolveFastCommandName({ agentDir: "/home/user/.pi/agent" })).toBe("fast");
+			expect(resolveFastCommandName({ primeHost: true, agentDir: "/home/user/.pi/agent" })).toBe("cliproxyapi-fast");
+			expect(resolveFastCommandName({ primeHost: false, agentDir: "/home/user/.prime/agent" })).toBe("fast");
+		});
+	});
+
+	it("exposes the raw agent dir predicate", () => {
+		expect(isPrimeAgentDirPath("/home/user/.prime/agent")).toBe(true);
+		expect(isPrimeAgentDirPath(".prime/agent")).toBe(true);
+		expect(isPrimeAgentDirPath("/home/user/.pi/agent")).toBe(false);
+		expect(isPrimeAgentDirPath(undefined)).toBe(false);
+	});
+});
+
+describe("auth.json reader", () => {
+	it("reads the single provider entry locally without a host import", () => {
+		const agentDir = tempAgentDir();
+		writeFileSync(
+			join(agentDir, AUTH_FILE_NAME),
+			JSON.stringify({
+				cliproxyapi: { type: "api_key", key: "plain-key" },
+				other: { type: "api_key", key: "not-mine" },
+			}),
+			"utf8",
+		);
+
+		expect(readAuthCredential(agentDir, "cliproxyapi")).toEqual({ type: "api_key", key: "plain-key" });
+		expect(readAuthCredential(agentDir, "missing-provider")).toBeNull();
+	});
+
+	it("returns null for a missing or malformed auth.json", () => {
+		const agentDir = tempAgentDir();
+		expect(readAuthCredential(agentDir, "cliproxyapi")).toBeNull();
+		writeFileSync(join(agentDir, AUTH_FILE_NAME), "not json", "utf8");
+		expect(readAuthCredential(agentDir, "cliproxyapi")).toBeNull();
+		expect(loadAuthConnection(agentDir, "cliproxyapi")).toBeNull();
+	});
+});
+
+describe("debug logging", () => {
+	function withDebug(value: string | undefined, run: () => void): void {
+		const previous = process.env.CLIPROXYAPI_DEBUG;
+		if (value === undefined) {
+			delete process.env.CLIPROXYAPI_DEBUG;
+		} else {
+			process.env.CLIPROXYAPI_DEBUG = value;
+		}
+		try {
+			run();
+		} finally {
+			if (previous === undefined) {
+				delete process.env.CLIPROXYAPI_DEBUG;
+			} else {
+				process.env.CLIPROXYAPI_DEBUG = previous;
+			}
+		}
+	}
+
+	it("stays silent unless CLIPROXYAPI_DEBUG is enabled", () => {
+		const info = vi.spyOn(console, "info").mockImplementation(() => {});
+		try {
+			withDebug(undefined, () => {
+				expect(isDebugEnabled()).toBe(false);
+				debugLog("selected route", { api: "openai-responses" });
+			});
+			expect(info).not.toHaveBeenCalled();
+
+			withDebug("true", () => {
+				expect(isDebugEnabled()).toBe(true);
+				debugLog("selected route", { api: "openai-responses", skipped: undefined });
+			});
+			expect(info).toHaveBeenCalledWith("[pi-cliproxyapi-provider][debug] selected route api=openai-responses");
+		} finally {
+			info.mockRestore();
+		}
 	});
 });
