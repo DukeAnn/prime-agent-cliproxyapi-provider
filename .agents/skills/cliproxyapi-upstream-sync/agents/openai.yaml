@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sync ClipProxyAPI Upstream"
+  short_description: "Safely merge official ClipProxyAPI provider upgrades"
+  default_prompt: "Use $cliproxyapi-upstream-sync to inspect and safely sync the latest official provider update."
