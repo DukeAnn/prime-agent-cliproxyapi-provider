@@ -326,6 +326,6 @@ Disable just this helper via `pi config` if you only want the CLIProxyAPI provid
 - Login final step validates credentials by requesting models:
   - HTTP 200 (including empty catalog) → credentials are persisted
   - non-200 / network / invalid baseUrl → nothing is persisted; re-enter baseUrl + API key
-- If CPA returns HTTP 200 with zero usable models: login still succeeds; re-run `/login CLIProxyAPI` later after models become available.
+- If CPA returns HTTP 200 with a reduced or empty catalog: matching cached models remain available for seven days from when they first disappear. Missing models are marked stale, and the provider refreshes the catalog in the background. Models that return have their stale flag cleared. Retention never mixes caches from different transport modes.
 - If the selected model does not provide a non-empty `service_tiers` array: the request is left unchanged; `/fast` still updates the global preference and warns when enabling it.
 - After `/compact`, threshold compaction, or overflow recovery, the provider closes the reused Codex WebSocket for the current session. CLIProxyAPI binds server-side context to the connection, so a reused socket would keep reporting a near-full `cacheRead` and retrigger proactive compaction even though the client context is now small. SSE is unaffected because it bills from the request body.

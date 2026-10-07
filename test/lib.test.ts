@@ -21,11 +21,13 @@ import {
 	fetchModelsDevCostMap,
 	firstNonEmpty,
 	isDebugEnabled,
+	isModelReferencedAsDefault,
 	isPrimeAgentDirPath,
 	isPrimeHost,
 	isUnauthorizedModelsError,
 	loadAuthConnection,
 	loadConfigFile,
+	loadConfiguredDefaultSettings,
 	ModelsHttpError,
 	matchModelCost,
 	parseBooleanSetting,
@@ -534,6 +536,38 @@ describe("config and auth file helpers", () => {
 			providerName: DEFAULT_PROVIDER_NAME,
 		});
 		expect(DEFAULT_BASE_URL).toBe("http://127.0.0.1:8317");
+	});
+
+	it("loads configured default settings from settings.json", () => {
+		const agentDir = tempAgentDir();
+		expect(loadConfiguredDefaultSettings(agentDir)).toEqual({});
+
+		writeFileSync(
+			join(agentDir, "settings.json"),
+			JSON.stringify({ defaultProvider: "google", defaultModel: "gemini-3.8-flash-high" }),
+			"utf8",
+		);
+		expect(loadConfiguredDefaultSettings(agentDir)).toEqual({
+			defaultProvider: "google",
+			defaultModel: "gemini-3.8-flash-high",
+		});
+	});
+
+	it("checks if a model is referenced as default", () => {
+		expect(isModelReferencedAsDefault(undefined, "model-a", "cliproxyapi")).toBe(false);
+		expect(
+			isModelReferencedAsDefault(
+				{ defaultModel: "model-a", defaultProvider: "cliproxyapi" },
+				"model-a",
+				"cliproxyapi",
+			),
+		).toBe(true);
+		expect(
+			isModelReferencedAsDefault({ defaultModel: "model-a", defaultProvider: "google" }, "model-a", "cliproxyapi"),
+		).toBe(false);
+		expect(isModelReferencedAsDefault({ defaultModel: "cliproxyapi/model-a" }, "model-a", "cliproxyapi")).toBe(true);
+		expect(isModelReferencedAsDefault({ defaultModel: "cliproxyapi:model-a" }, "model-a", "cliproxyapi")).toBe(true);
+		expect(isModelReferencedAsDefault({ defaultModel: "other/model-a" }, "model-a", "cliproxyapi")).toBe(false);
 	});
 });
 

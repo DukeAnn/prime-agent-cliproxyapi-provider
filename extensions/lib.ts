@@ -160,6 +160,9 @@ export interface PiProviderModel {
 	contextWindow: number;
 	maxTokens: number;
 	thinkingLevelMap?: ThinkingLevelMap;
+	stale?: boolean;
+	lastSeenAt?: number;
+	staleSince?: number;
 }
 
 export interface MappedModels {
@@ -423,6 +426,52 @@ export function loadConfigFile(agentDir: string): CliproxyConfigFile {
 		}
 		return {};
 	}
+}
+
+export const SETTINGS_FILE_NAME = "settings.json";
+
+export interface ConfiguredDefaultModelSettings {
+	defaultProvider?: string;
+	defaultModel?: string;
+}
+
+export function loadConfiguredDefaultSettings(agentDir: string): ConfiguredDefaultModelSettings {
+	const settingsPath = join(agentDir, SETTINGS_FILE_NAME);
+	try {
+		const parsed = JSON.parse(readFileSync(settingsPath, "utf8")) as Record<string, unknown>;
+		return {
+			defaultProvider:
+				typeof parsed.defaultProvider === "string" && parsed.defaultProvider.trim()
+					? parsed.defaultProvider.trim()
+					: undefined,
+			defaultModel:
+				typeof parsed.defaultModel === "string" && parsed.defaultModel.trim()
+					? parsed.defaultModel.trim()
+					: undefined,
+		};
+	} catch {
+		return {};
+	}
+}
+
+export function isModelReferencedAsDefault(
+	configured: ConfiguredDefaultModelSettings | string | undefined,
+	modelId: string,
+	providerId: string,
+): boolean {
+	if (!configured) return false;
+	const settings: ConfiguredDefaultModelSettings =
+		typeof configured === "string" ? { defaultModel: configured } : configured;
+
+	if (!settings.defaultModel) return false;
+	const trimmed = settings.defaultModel.trim();
+	if (trimmed === `${providerId}/${modelId}` || trimmed === `${providerId}:${modelId}`) {
+		return true;
+	}
+	if (trimmed === modelId) {
+		return settings.defaultProvider === undefined || settings.defaultProvider === providerId;
+	}
+	return false;
 }
 
 export function saveConfigFile(agentDir: string, config: CliproxyConfigFile): void {
@@ -1218,6 +1267,95 @@ export async function loadMappedModels(
 	};
 }
 
+export const DEFAULT_MODEL_STALE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+export interface MergeModelsResult {
+	merged: MappedModels;
+	retainedStaleModels: PiProviderModel[];
+	droppedModelIds: string[];
+}
+
+/**
+ * Merge newly fetched models with the existing disk cache to prevent transient
+ * upstream pruning (such as HTTP 503 / 429 capacity blips) from wiping out valid models.
+ */
+export function mergeModelsWithExistingCache(
+	existingCache: ModelsCacheFile | null,
+	fresh: MappedModels,
+	now = Date.now(),
+	staleTtlMs = DEFAULT_MODEL_STALE_TTL_MS,
+): MergeModelsResult {
+	if (!existingCache || !Array.isArray(existingCache.models) || existingCache.models.length === 0) {
+		const modelsWithTimestamp = fresh.models.map((model) => ({
+			...model,
+			lastSeenAt: now,
+			stale: false,
+		}));
+		return {
+			merged: {
+				...fresh,
+				models: modelsWithTimestamp,
+			},
+			retainedStaleModels: [],
+			droppedModelIds: [],
+		};
+	}
+
+	const freshModelMap = new Map<string, PiProviderModel>();
+	const freshFastSet = new Set(fresh.fastModelIds);
+
+	for (const model of fresh.models) {
+		const updated: PiProviderModel = {
+			...model,
+			lastSeenAt: now,
+			stale: false,
+		};
+		delete updated.staleSince;
+		freshModelMap.set(model.id, updated);
+	}
+
+	const retainedStaleModels: PiProviderModel[] = [];
+	const droppedModelIds: string[] = [];
+
+	for (const prevModel of existingCache.models) {
+		if (freshModelMap.has(prevModel.id)) {
+			continue;
+		}
+		const lastSeen = prevModel.lastSeenAt ?? existingCache.fetchedAt ?? now;
+		const isFirstMissing = prevModel.stale !== true;
+		const staleSince = isFirstMissing ? now : (prevModel.staleSince ?? lastSeen);
+
+		// Retain models from the moment they first go missing until they have been
+		// missing across the full stale retention window.
+		if (now - staleSince < staleTtlMs) {
+			const retained: PiProviderModel = {
+				...prevModel,
+				lastSeenAt: lastSeen,
+				staleSince,
+				stale: true,
+			};
+			retainedStaleModels.push(retained);
+			if (existingCache.fastModelIds?.includes(prevModel.id) && !freshFastSet.has(prevModel.id)) {
+				freshFastSet.add(prevModel.id);
+			}
+		} else {
+			droppedModelIds.push(prevModel.id);
+		}
+	}
+
+	const mergedModels = [...freshModelMap.values(), ...retainedStaleModels];
+
+	return {
+		merged: {
+			...fresh,
+			models: mergedModels,
+			fastModelIds: Array.from(freshFastSet),
+		},
+		retainedStaleModels,
+		droppedModelIds,
+	};
+}
+
 /**
  * Load mapped models from the matching cache, or fetch remotely and update the cache.
  * A forced refresh always bypasses the cache.
@@ -1232,21 +1370,21 @@ export async function resolveMappedModels(
 		signal?: AbortSignal;
 		shouldCommit?: () => boolean;
 		transportMode?: TransportMode;
+		staleTtlMs?: number;
 	} = {},
 ): Promise<ResolvedModelsResult> {
 	const transportMode = options.transportMode ?? DEFAULT_TRANSPORT_MODE;
 	const cacheMatchesFastMode = (cache: ModelsCacheFile): boolean =>
 		options.fastMode === undefined || (cache.fastMode ?? false) === options.fastMode;
 
+	const existingCache = loadModelsCache(agentDir, baseUrlInput, transportMode);
 	if (!options.forceRefresh) {
-		// A cache written for another protocol routing mode is discarded.
-		const cache = loadModelsCache(agentDir, baseUrlInput, transportMode);
-		if (cache && cacheMatchesFastMode(cache)) {
-			return { loaded: cache, fromCache: true };
+		if (existingCache && cacheMatchesFastMode(existingCache)) {
+			return { loaded: existingCache, fromCache: true };
 		}
 	}
 
-	const loaded = await loadMappedModels(
+	const fresh = await loadMappedModels(
 		baseUrlInput,
 		apiKey,
 		options.fastMode,
@@ -1254,8 +1392,9 @@ export async function resolveMappedModels(
 		options.signal,
 		transportMode,
 	);
+	const { merged } = mergeModelsWithExistingCache(existingCache, fresh, Date.now(), options.staleTtlMs);
 	if (!options.signal?.aborted && (options.shouldCommit?.() ?? true)) {
-		saveModelsCache(agentDir, loaded);
+		saveModelsCache(agentDir, merged);
 	}
-	return { loaded, fromCache: false };
+	return { loaded: merged, fromCache: false };
 }
